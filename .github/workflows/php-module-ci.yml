@@ -1,0 +1,121 @@
+name: PHP module CI
+
+# Reusable CI for magenxcommerce/module-* repositories.
+#
+# Callers supply only their triggers; everything below is layout-agnostic, so
+# a module needs no per-repo configuration. Sources are discovered from the
+# repository root rather than named, because a hardcoded directory list
+# produces a silent green run in any module that does not match it.
+
+on:
+  workflow_call:
+    inputs:
+      php-versions:
+        description: 'JSON array of PHP versions for the syntax matrix.'
+        type: string
+        default: '["8.3", "8.4", "8.5"]'
+      tools-php-version:
+        description: 'PHP version used for PHPCS and the validation steps.'
+        type: string
+        default: '8.4'
+      phpcs-severity:
+        description: 'PHPCS severity gate. 8 is the usual starting point; 10 is blocker-only.'
+        type: string
+        default: '8'
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(inputs.php-versions) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: composer:v2
+
+      # The count guard is load-bearing: without it an empty file set exits 0
+      # and the check goes green having linted nothing.
+      - name: Syntax check
+        run: |
+          mapfile -d '' files < <(find . \
+            -path ./.git -prune -o -path ./vendor -prune -o \
+            \( -name '*.php' -o -name '*.phtml' \) -print0)
+          echo "Linting ${#files[@]} file(s)"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no PHP sources found - check the workflow's discovery rules"
+            exit 1
+          fi
+          printf '%s\0' "${files[@]}" | xargs -0 -n1 -P4 php -n -l
+
+      # --no-check-all: magento/* requires commonly use unbound "*" constraints,
+      # which --strict alone rejects. --no-check-lock: modules ship no lock file.
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-all --no-check-lock
+
+  static:
+    name: Magento coding standard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ inputs.tools-php-version }}
+          coverage: none
+          tools: composer:v2
+
+      - name: Cache coding-standard install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/phpcs
+          key: phpcs-${{ runner.os }}-mcs-v1
+
+      # magento/magento-coding-standard is on Packagist, but magento/framework
+      # is not - installing it into the module's own composer.json would force
+      # resolution of the credential-gated Magento requires. Keep it separate.
+      - name: Install magento/magento-coding-standard (isolated)
+        run: |
+          mkdir -p "$RUNNER_TEMP/phpcs"
+          cd "$RUNNER_TEMP/phpcs"
+          if [ ! -f composer.json ]; then
+            composer init --no-interaction --name=magenxcommerce/ci-tools
+            composer config --no-plugins \
+              allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+          fi
+          composer require --no-interaction --no-progress magento/magento-coding-standard
+
+      # Prefer the repo's own ruleset when it has one, so local runs and CI
+      # agree. Modules without one still get the standard applied.
+      - name: PHPCS
+        run: |
+          PHPCS="$RUNNER_TEMP/phpcs/vendor/bin/phpcs"
+          if [ -f phpcs.xml.dist ] || [ -f phpcs.xml ]; then
+            echo "Using the repository's own ruleset"
+            "$PHPCS"
+          else
+            echo "No ruleset in repo; applying Magento2 at severity ${{ inputs.phpcs-severity }}"
+            "$PHPCS" --standard=Magento2 \
+              --severity='${{ inputs.phpcs-severity }}' \
+              --extensions=php,phtml,xml,js \
+              --ignore='*/vendor/*,*/.git/*,*/.github/*' \
+              -p .
+          fi
+
+      # ubuntu-latest carries no xmllint, so validate with the PHP that
+      # setup-php just installed rather than apt-getting libxml2-utils.
+      - name: XML + JSON well-formedness
+        run: |
+          find . -path ./.git -prune -o -path ./vendor -prune -o -name '*.xml' -print0 \
+            | xargs -0 -r -n1 php -r 'libxml_use_internal_errors(true); if (@simplexml_load_file($argv[1]) === false) { $e = libxml_get_errors()[0] ?? null; fwrite(STDERR, $argv[1] . ($e ? ":{$e->line}: " . trim($e->message) : ": invalid XML") . PHP_EOL); exit(1); }' --
+          find . -path ./.git -prune -o -path ./vendor -prune -o -name '*.json' -print0 \
+            | xargs -0 -r -n1 php -r 'json_decode(file_get_contents($argv[1])); if (json_last_error() !== JSON_ERROR_NONE) { fwrite(STDERR, $argv[1] . ": " . json_last_error_msg() . PHP_EOL); exit(1); }' --
