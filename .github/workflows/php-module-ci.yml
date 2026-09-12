@@ -22,6 +22,17 @@ on:
         description: 'PHPCS severity gate. 8 is the usual starting point; 10 is blocker-only.'
         type: string
         default: '8'
+      phpunit-version:
+        description: 'PHPUnit version installed as a tool, used when the module vendors none itself.'
+        type: string
+        default: '10.5'
+      phpunit-testsuite:
+        description: >-
+          Name of the suite to run. Empty runs everything the configuration
+          declares. Only set this when every caller of this workflow defines a
+          suite by that name - a missing suite is a failure, not a skip.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -119,3 +130,152 @@ jobs:
             | xargs -0 -r -n1 php -r 'libxml_use_internal_errors(true); if (@simplexml_load_file($argv[1]) === false) { $e = libxml_get_errors()[0] ?? null; fwrite(STDERR, $argv[1] . ($e ? ":{$e->line}: " . trim($e->message) : ": invalid XML") . PHP_EOL); exit(1); }' --
           find . -path ./.git -prune -o -path ./vendor -prune -o -name '*.json' -print0 \
             | xargs -0 -r -n1 php -r 'json_decode(file_get_contents($argv[1])); if (json_last_error() !== JSON_ERROR_NONE) { fwrite(STDERR, $argv[1] . ": " . json_last_error_msg() . PHP_EOL); exit(1); }' --
+
+  tests:
+    name: PHPUnit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Not every module has a suite yet, so the job is self-gating: it decides
+      # from the checkout whether there is anything to run. A configuration file
+      # that matches no tests is treated as a mistake rather than a skip - that
+      # is the case where "no tests" silently means "tests stopped running".
+      - name: Detect test suite
+        id: detect
+        run: |
+          config=''
+          for candidate in phpunit.xml phpunit.xml.dist; do
+            if [ -f "$candidate" ]; then config="$candidate"; break; fi
+          done
+
+          mapfile -d '' tests < <(find . \
+            -path ./.git -prune -o -path ./vendor -prune -o \
+            -name '*Test.php' -print0)
+          echo "Found ${#tests[@]} test file(s); configuration: ${config:-none}"
+
+          if [ "${#tests[@]}" -eq 0 ]; then
+            if [ -n "$config" ]; then
+              echo "::error::$config is present but no *Test.php files were found"
+              exit 1
+            fi
+            echo "This module has no PHPUnit tests yet - skipping the remaining steps."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "config=$config" >> "$GITHUB_OUTPUT"
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        if: steps.detect.outputs.run == 'true'
+        with:
+          php-version: ${{ inputs.tools-php-version }}
+          coverage: none
+          tools: composer:v2, phpunit:${{ inputs.phpunit-version }}
+
+      # Best effort by design: a module whose requires resolve from Packagist
+      # gets a real vendor/, and one that pulls credential-gated magento/*
+      # packages does not. Failing here would take down every module whose
+      # tests need no dependencies at all, so the warning carries the signal
+      # and PHPUnit reports what is actually missing.
+      - name: Install module dependencies
+        if: steps.detect.outputs.run == 'true' && hashFiles('composer.json') != ''
+        run: |
+          if composer install --no-interaction --no-progress --no-ansi; then
+            echo "Dependencies installed"
+          else
+            echo "::warning::composer install failed - continuing without vendor/ (magento/* requires usually need repo.magento.com credentials)"
+          fi
+
+      # Modules are tested in place, not inside a Magento root, so nothing has
+      # generated an autoloader for them. Map the module's own PSR-4 prefixes
+      # onto the checkout instead.
+      - name: Generate fallback bootstrap
+        if: steps.detect.outputs.run == 'true' && steps.detect.outputs.config == ''
+        run: |
+          cat > "$RUNNER_TEMP/phpunit-bootstrap.php" <<'PHP'
+          <?php
+
+          $root = getenv('GITHUB_WORKSPACE') ?: getcwd();
+
+          if (is_file($root . '/vendor/autoload.php')) {
+              require $root . '/vendor/autoload.php';
+          }
+
+          $manifest = is_file($root . '/composer.json')
+              ? (json_decode((string) file_get_contents($root . '/composer.json'), true) ?: [])
+              : [];
+
+          // "files" entries are deliberately not required: registration.php calls
+          // into magento/framework, which is not installed in this context.
+          $prefixes = [];
+          foreach (['autoload', 'autoload-dev'] as $section) {
+              foreach ($manifest[$section]['psr-4'] ?? [] as $prefix => $paths) {
+                  foreach ((array) $paths as $path) {
+                      $prefixes[$prefix][] = rtrim($root . '/' . trim((string) $path, '/'), '/');
+                  }
+              }
+          }
+
+          spl_autoload_register(static function (string $class) use ($prefixes): void {
+              foreach ($prefixes as $prefix => $dirs) {
+                  if (strncmp($class, $prefix, strlen($prefix)) !== 0) {
+                      continue;
+                  }
+                  $relative = str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
+                  foreach ($dirs as $dir) {
+                      if (is_file($dir . '/' . $relative)) {
+                          require $dir . '/' . $relative;
+                          return;
+                      }
+                  }
+              }
+          });
+          PHP
+          php -l "$RUNNER_TEMP/phpunit-bootstrap.php"
+
+      - name: PHPUnit
+        if: steps.detect.outputs.run == 'true'
+        env:
+          CONFIG: ${{ steps.detect.outputs.config }}
+          SUITE: ${{ inputs.phpunit-testsuite }}
+        run: |
+          # A vendored PHPUnit is the one the module's tests were written
+          # against; the pinned tool is only the fallback.
+          PHPUNIT=phpunit
+          if [ -x vendor/bin/phpunit ]; then PHPUNIT=vendor/bin/phpunit; fi
+          "$PHPUNIT" --version | head -1
+
+          args=(--do-not-cache-result)
+
+          if [ -n "$CONFIG" ]; then
+            args+=(--configuration "$CONFIG")
+            if [ -n "$SUITE" ]; then args+=(--testsuite "$SUITE"); fi
+          else
+            echo "No phpunit.xml in the repository; generating one for the discovered tests"
+            cat > "$RUNNER_TEMP/phpunit.xml" <<XML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <phpunit bootstrap="$RUNNER_TEMP/phpunit-bootstrap.php" colors="true">
+            <testsuites>
+              <testsuite name="${SUITE:-module}">
+                <directory suffix="Test.php">$GITHUB_WORKSPACE</directory>
+                <exclude>$GITHUB_WORKSPACE/vendor</exclude>
+              </testsuite>
+            </testsuites>
+          </phpunit>
+          XML
+            args+=(--configuration "$RUNNER_TEMP/phpunit.xml")
+          fi
+
+          # Same guard as the syntax job's file count: a suite that matches
+          # nothing exits 0 and reports success having run no tests. The flag
+          # only exists from PHPUnit 10.4 on, so a vendored 9.x says so rather
+          # than failing on an unknown option.
+          if "$PHPUNIT" --help 2>/dev/null | grep -q -- '--fail-on-empty-test-suite'; then
+            args+=(--fail-on-empty-test-suite)
+          else
+            echo "::warning::$PHPUNIT does not support --fail-on-empty-test-suite; an empty run will not fail"
+          fi
+
+          "$PHPUNIT" "${args[@]}"
