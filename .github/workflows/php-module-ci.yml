@@ -26,6 +26,13 @@ on:
         description: 'PHPUnit version installed as a tool, used when the module vendors none itself.'
         type: string
         default: '10.5'
+      php-extensions:
+        description: >-
+          Extensions installed for the test run. The default covers what
+          magento/framework declares; without them composer refuses to install
+          it at all. Extend rather than replace when a module needs more.
+        type: string
+        default: 'bcmath, curl, dom, ftp, gd, iconv, intl, mbstring, openssl, simplexml, soap, sodium, xsl, zip'
       phpunit-testsuite:
         description: >-
           Name of the suite to run. Empty runs everything the configuration
@@ -33,6 +40,17 @@ on:
           suite by that name - a missing suite is a failure, not a skip.
         type: string
         default: ''
+    secrets:
+      MAGENTO_PUBLIC_KEY:
+        description: >-
+          Marketplace access key (public half) for repo.magento.com. Without
+          the pair, modules that require magento/* are tested without their
+          dependencies. Names match the repository/organisation secrets so
+          callers can pass `secrets: inherit`.
+        required: false
+      MAGENTO_PRIVATE_KEY:
+        description: 'Marketplace access key (private half) for repo.magento.com.'
+        required: false
 
 permissions:
   contents: read
@@ -171,21 +189,52 @@ jobs:
         if: steps.detect.outputs.run == 'true'
         with:
           php-version: ${{ inputs.tools-php-version }}
+          extensions: ${{ inputs.php-extensions }}
           coverage: none
           tools: composer:v2, phpunit:${{ inputs.phpunit-version }}
 
-      # Best effort by design: a module whose requires resolve from Packagist
-      # gets a real vendor/, and one that pulls credential-gated magento/*
-      # packages does not. Failing here would take down every module whose
-      # tests need no dependencies at all, so the warning carries the signal
-      # and PHPUnit reports what is actually missing.
+      # magento/framework and friends are not on Packagist, so a module that
+      # requires them needs both the repo.magento.com repository and a
+      # Marketplace key pair. With the keys the install has to succeed -
+      # falling through to a run without vendor/ would test the module against
+      # whatever the fallback autoloader happens to find. Without them it stays
+      # best effort, so modules whose tests need no dependencies still run.
       - name: Install module dependencies
         if: steps.detect.outputs.run == 'true' && hashFiles('composer.json') != ''
+        env:
+          MAGENTO_PUBLIC_KEY: ${{ secrets.MAGENTO_PUBLIC_KEY }}
+          MAGENTO_PRIVATE_KEY: ${{ secrets.MAGENTO_PRIVATE_KEY }}
         run: |
+          authenticated=0
+          if [ -n "$MAGENTO_PUBLIC_KEY" ] && [ -n "$MAGENTO_PRIVATE_KEY" ]; then
+            # COMPOSER_AUTH rather than `composer config --auth`: the keys stay
+            # in the process environment, where the runner masks them, instead
+            # of being written to an auth.json that a later step, a cache entry
+            # or an uploaded artifact could carry out of the job.
+            COMPOSER_AUTH="$(jq -cn \
+              --arg user "$MAGENTO_PUBLIC_KEY" \
+              --arg pass "$MAGENTO_PRIVATE_KEY" \
+              '{"http-basic":{"repo.magento.com":{"username":$user,"password":$pass}}}')"
+            export COMPOSER_AUTH
+            authenticated=1
+
+            # Modules declare the requirement but not where it comes from -
+            # in a real install that is the root project's job.
+            if ! grep -q 'repo\.magento\.com' composer.json; then
+              composer config repositories.magento composer https://repo.magento.com/
+            fi
+            echo "repo.magento.com credentials configured"
+          else
+            echo "No Marketplace key pair supplied; magento/* requires will not resolve"
+          fi
+
           if composer install --no-interaction --no-progress --no-ansi; then
             echo "Dependencies installed"
+          elif [ "$authenticated" -eq 1 ]; then
+            echo "::error::composer install failed with repo.magento.com credentials configured. If the module pins a framework version that predates PHP ${{ inputs.tools-php-version }}, call this workflow with a lower tools-php-version."
+            exit 1
           else
-            echo "::warning::composer install failed - continuing without vendor/ (magento/* requires usually need repo.magento.com credentials)"
+            echo "::warning::composer install failed - continuing without vendor/. Pass MAGENTO_PUBLIC_KEY and MAGENTO_PRIVATE_KEY (or 'secrets: inherit') if this module requires magento/* packages."
           fi
 
       # Modules are tested in place, not inside a Magento root, so nothing has
