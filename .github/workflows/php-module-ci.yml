@@ -228,7 +228,12 @@ jobs:
             echo "No Marketplace key pair supplied; magento/* requires will not resolve"
           fi
 
-          if composer install --no-interaction --no-progress --no-ansi; then
+          # --no-plugins: magento/framework requires Composer plugins (the
+          # dependency-version audit, the Magento installers) that a module
+          # checkout's allow-plugins does not list, so Composer refuses the
+          # install. Unit tests need the classes, not what the plugins do to
+          # a Magento root.
+          if composer install --no-interaction --no-progress --no-ansi --no-plugins; then
             echo "Dependencies installed"
           elif [ "$authenticated" -eq 1 ]; then
             echo "::error::composer install failed with repo.magento.com credentials configured. If the module pins a framework version that predates PHP ${{ inputs.tools-php-version }}, call this workflow with a lower tools-php-version."
