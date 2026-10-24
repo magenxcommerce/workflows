@@ -51,6 +51,14 @@ on:
       MAGENTO_PRIVATE_KEY:
         description: 'Marketplace access key (private half) for repo.magento.com.'
         required: false
+      MAGENX_MODULES_TOKEN:
+        description: >-
+          GitHub token with read access to the private magenxcommerce/module-*
+          repositories, for a module that requires a sibling module (declared
+          as a "vcs" entry under "repositories" in its composer.json). Given to
+          composer as a github.com OAuth token only; without it such a require
+          does not resolve.
+        required: false
 
 permissions:
   contents: read
@@ -204,18 +212,29 @@ jobs:
         env:
           MAGENTO_PUBLIC_KEY: ${{ secrets.MAGENTO_PUBLIC_KEY }}
           MAGENTO_PRIVATE_KEY: ${{ secrets.MAGENTO_PRIVATE_KEY }}
+          MAGENX_MODULES_TOKEN: ${{ secrets.MAGENX_MODULES_TOKEN }}
         run: |
+          # COMPOSER_AUTH rather than `composer config --auth`: the keys stay
+          # in the process environment, where the runner masks them, instead
+          # of being written to an auth.json that a later step, a cache entry
+          # or an uploaded artifact could carry out of the job.
+          auth='{}'
+
+          # Sibling modules are private GitHub repositories. The job's own
+          # GITHUB_TOKEN is scoped to the calling repository, so reading them
+          # takes a token of its own.
+          if [ -n "$MAGENX_MODULES_TOKEN" ]; then
+            auth="$(jq -c --arg token "$MAGENX_MODULES_TOKEN" \
+              '. + {"github-oauth":{"github.com":$token}}' <<< "$auth")"
+            echo "GitHub token for private sibling modules configured"
+          fi
+
           authenticated=0
           if [ -n "$MAGENTO_PUBLIC_KEY" ] && [ -n "$MAGENTO_PRIVATE_KEY" ]; then
-            # COMPOSER_AUTH rather than `composer config --auth`: the keys stay
-            # in the process environment, where the runner masks them, instead
-            # of being written to an auth.json that a later step, a cache entry
-            # or an uploaded artifact could carry out of the job.
-            COMPOSER_AUTH="$(jq -cn \
+            auth="$(jq -c \
               --arg user "$MAGENTO_PUBLIC_KEY" \
               --arg pass "$MAGENTO_PRIVATE_KEY" \
-              '{"http-basic":{"repo.magento.com":{"username":$user,"password":$pass}}}')"
-            export COMPOSER_AUTH
+              '. + {"http-basic":{"repo.magento.com":{"username":$user,"password":$pass}}}' <<< "$auth")"
             authenticated=1
 
             # Modules declare the requirement but not where it comes from -
@@ -228,6 +247,11 @@ jobs:
             echo "No Marketplace key pair supplied; magento/* requires will not resolve"
           fi
 
+          if [ "$auth" != '{}' ]; then
+            COMPOSER_AUTH="$auth"
+            export COMPOSER_AUTH
+          fi
+
           # --no-plugins: magento/framework requires Composer plugins (the
           # dependency-version audit, the Magento installers) that a module
           # checkout's allow-plugins does not list, so Composer refuses the
@@ -236,7 +260,7 @@ jobs:
           if composer install --no-interaction --no-progress --no-ansi --no-plugins; then
             echo "Dependencies installed"
           elif [ "$authenticated" -eq 1 ]; then
-            echo "::error::composer install failed with repo.magento.com credentials configured. If the module pins a framework version that predates PHP ${{ inputs.tools-php-version }}, call this workflow with a lower tools-php-version."
+            echo "::error::composer install failed with repo.magento.com credentials configured. If the module pins a framework version that predates PHP ${{ inputs.tools-php-version }}, call this workflow with a lower tools-php-version. If it requires a private magenxcommerce module, pass MAGENX_MODULES_TOKEN."
             exit 1
           else
             echo "::warning::composer install failed - continuing without vendor/. Pass MAGENTO_PUBLIC_KEY and MAGENTO_PRIVATE_KEY (or 'secrets: inherit') if this module requires magento/* packages."
