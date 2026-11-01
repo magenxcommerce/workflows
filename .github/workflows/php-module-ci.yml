@@ -13,7 +13,7 @@ on:
       php-versions:
         description: 'JSON array of PHP versions for the syntax matrix.'
         type: string
-        default: '["8.3", "8.4", "8.5"]'
+        default: '["8.4", "8.5"]'
       tools-php-version:
         description: 'PHP version used for PHPCS and the validation steps.'
         type: string
